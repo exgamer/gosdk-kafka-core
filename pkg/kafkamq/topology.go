@@ -1,8 +1,8 @@
 package kafkamq
 
 import (
+	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/IBM/sarama"
 )
@@ -58,11 +58,16 @@ func DeclareTopics(brokers []string, saramaConfig *sarama.Config, specs ...Topic
 		}
 
 		if err := admin.CreateTopic(spec.Name, detail, false); err != nil {
-			if !strings.Contains(err.Error(), "Topic with this name already exists") {
+			if !isTopicAlreadyExists(err) {
 				return fmt.Errorf("declare topic %q: %w", spec.Name, err)
 			}
 		}
 	}
 
 	return nil
+}
+
+// isTopicAlreadyExists — топик уже есть (sarama.TopicError разворачивается в KError).
+func isTopicAlreadyExists(err error) bool {
+	return errors.Is(err, sarama.ErrTopicAlreadyExists)
 }

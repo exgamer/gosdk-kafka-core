@@ -1,6 +1,7 @@
 package kafkamq
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,21 +27,14 @@ func NewPublisher(kafkaCfg *config.KafkaConfig, cfg ...config.PublisherOption) (
 		return nil, errors.New("nil kafka config")
 	}
 
-	pc := &wmkafka.PublisherConfig{Brokers: kafkaCfg.BrokersList()}
-
-	if kafkaCfg.ClientID != "" {
-		saramaCfg := wmkafka.DefaultSaramaSyncPublisherConfig()
-		saramaCfg.ClientID = kafkaCfg.ClientID
-		pc.OverwriteSaramaConfig = saramaCfg
-	}
-
-	for _, opt := range cfg {
-		opt(pc)
-	}
+	// Без явного sarama.Config (WithPublisherSaramaConfig) — надёжная публикация по умолчанию:
+	// RequiredAcks=WaitForAll, Idempotent=true, Net.MaxOpenRequests=1. Явный конфиг сервиса
+	// не перебивается; KAFKA_CLIENT_ID применяется после опций, если ClientID не выбран сервисом.
+	pc := resolvePublisherConfig(kafkaCfg, cfg)
 
 	log := newWatermillLogger()
 
-	pub, err := wmkafka.NewPublisher(*pc, log)
+	pub, err := wmkafka.NewPublisher(pc, log)
 	if err != nil {
 		return nil, fmt.Errorf("error creating publisher: %w", err)
 	}
@@ -120,6 +114,79 @@ func (p *Publisher) PublishBatchWithMetaData(topic string, meta map[string]strin
 	}
 
 	return nil
+}
+
+// --- публикация с ctx
+
+// PublishCtx - Publish, ограниченный ctx: отправка и подтверждение брокера. Если ctx истёк раньше подтверждения -
+// ошибка ctx; сообщение при этом могло дойти. Id корреляции ctx (sdkctx.CorrelationID) уходит в заголовок
+// correlation_id, если вызывающий не задал свой в метаданных; так во всех методах *Ctx. Методы без ctx id не ставят
+// (только явная метадата).
+func (p *Publisher) PublishCtx(ctx context.Context, topic string, payload any) error {
+	msg, err := messageForm(payload)
+	if err != nil {
+		return err
+	}
+
+	return p.publishCtx(ctx, topic, []*message.Message{msg})
+}
+
+// PublishWithMetaDataCtx - PublishWithMetaData, ограниченный ctx (см. PublishCtx).
+func (p *Publisher) PublishWithMetaDataCtx(ctx context.Context, topic string, meta map[string]string, payload any) error {
+	msg, err := messageFormWithMetaData(meta, payload)
+	if err != nil {
+		return err
+	}
+
+	return p.publishCtx(ctx, topic, []*message.Message{msg})
+}
+
+// PublishBatchCtx - PublishBatch, ограниченный ctx (см. PublishCtx).
+func (p *Publisher) PublishBatchCtx(ctx context.Context, topic string, payloads []any) error {
+	msgs, err := messagesForm(payloads)
+	if err != nil {
+		return fmt.Errorf("error creating messages: %w", err)
+	}
+
+	return p.publishCtx(ctx, topic, msgs)
+}
+
+// PublishBatchWithMetaDataCtx - PublishBatchWithMetaData, ограниченный ctx (см. PublishCtx).
+func (p *Publisher) PublishBatchWithMetaDataCtx(ctx context.Context, topic string, meta map[string]string, payloads []any) error {
+	msgs, err := messagesFormWithMetaData(meta, payloads)
+	if err != nil {
+		return fmt.Errorf("error creating messages: %w", err)
+	}
+
+	return p.publishCtx(ctx, topic, msgs)
+}
+
+func (p *Publisher) publishCtx(ctx context.Context, topic string, msgs []*message.Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	setCorrelationID(ctx, msgs)
+
+	// Отправка синхронная и без ctx - ожидание ограничивается здесь; горутина завершится сама,
+	// когда придёт ответ брокера.
+	done := make(chan error, 1)
+	go func() { done <- p.pub.Publish(topic, msgs...) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("error publishing message: %w", err)
+		}
+
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("publish not confirmed (the message may still be delivered): %w", ctx.Err())
+	}
 }
 
 // --- message helpers

@@ -87,13 +87,28 @@ config.NewConsumerFromNewestConfig("live-metrics")  // забирать толь
 
 ---
 
-## Ack / Nack
+## Id корреляции
 
-Как и в Rabbit, `msg.Ack()` коммитит offset, `msg.Nack()` вызывает повторную
-доставку (после паузы `config.WithNackResendSleep`, дефолт 100ms). Политика по
-умолчанию — `ActionNack` и для ошибок, и для паники в handler-е:
+`ctx` handler-а несёт сквозной id корреляции (`sdkctx.CorrelationID(ctx)`, gosdk-core) из заголовка `correlation_id`
+сообщения; нет — новый id, он же уходит в DLT. Все попытки одного сообщения — с одним id; публикации handler-а через
+`...Ctx(ctx, ...)` передают его дальше.
+
+## Ошибки handler-а: повторы и DLT
+
+Handler вернул ошибку или запаниковал — по умолчанию (`ActionNack`) SDK повторяет вызов до 5 раз
+с паузами 1 с, 5 с, 15 с, 15 с, затем публикует сообщение в `<topic>.dlt` (нет топика — один раз
+пытается создать) и подтверждает его. Пока DLT недоступен, сообщение не подтверждается. Ребаланс
+ждёт всю серию попыток; при превышении `Rebalance.Timeout` возможна повторная обработка и дубли
+в DLT — handler должен быть идемпотентным. Подробно — [README: Повторы и DLT](../../README.md#-повторы-и-dlt).
 
 ```go
-consumer.WithErrorAction(kafkamq.ActionAck) // не ретраить бизнес-ошибки
-consumer.WithPanicAction(kafkamq.ActionNack)
+consumer.WithErrorAction(kafkamq.ActionAck) // бизнес-ошибки не повторять и не слать в DLT (сообщение теряется)
+consumer.WithPanicAction(kafkamq.ActionNack) // по умолчанию: повторы, затем DLT
 ```
+
+Handler получает ctx, который не отменяется остановкой сервиса посреди обработки (значения
+контекста сохраняются). Долгие операции ограничивайте своими таймаутами.
+
+Payload сообщения в Sentry по умолчанию не уходит (только topic, partition, offset, длина и хеш
+ключа, номер попытки); включить явно — `consumer.WithSentryPayloadLimit(n)` с `n > 0` (первые `n` байт),
+`0` и меньше — не отправлять.

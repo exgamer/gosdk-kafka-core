@@ -81,6 +81,18 @@ KAFKA_CLIENT_ID=my-service
 окружение главнее `.env`, пустая переменная в окружении перекрывает значение из `.env`.
 Требуется `gosdk-core` v1.0.27+.
 
+`KAFKA_CLIENT_ID` применяется после опций handler-а/publisher-а: помощники
+`NewConsumerGroupConfig`/`NewConsumerFromOldestConfig`/`NewConsumerFromNewestConfig` и
+`WithPublisherSaramaConfig`/`WithConsumerSaramaConfig` с `ClientID` из `""`, `"watermill"` или
+`"sarama"` (дефолты библиотек) его больше не затирают. Свой `ClientID` в `sarama.Config` сервиса
+не перебивается.
+
+⚠️ Начальный offset без помощника: если handler не передаёт `NewConsumerFromOldestConfig`/
+`NewConsumerFromNewestConfig`/`NewConsumerGroupConfig` (или свой `sarama.Config`), действует
+дефолт sarama — `OffsetNewest`: новая группа (или группа, чей offset истёк по retention) начинает
+с конца топика, и сообщения, записанные до первого запуска, не читаются. Чтобы не терять историю —
+`NewConsumerFromOldestConfig`.
+
 ⚠️ Без consumer group (ни из `KAFKA_CONSUMER_GROUP`, ни из явной опции) Kafka не хранит
 committed offset для подписчика: `msg.Ack()`/`msg.Nack()` ничего не коммитят, и после
 каждого реконнекта сообщения будут вычитаны заново. `Consumer.RegisterHandler` в этом
@@ -93,6 +105,9 @@ committed offset для подписчика: `msg.Ack()`/`msg.Nack()` ниче�
 
 - `config.WithCustomMarshaler(m kafka.Marshaler)` / `config.WithCustomUnmarshaler(u kafka.Unmarshaler)` — своя реализация маршалинга (в отличие от `WithMarshaler`/`WithUnmarshaler`, принимающих только `kafka.DefaultMarshaler`).
 - `config.WithPublisherSaramaConfig` / `config.WithConsumerSaramaConfig` — полная замена `*sarama.Config` (TLS, acks, retries, compression, session timeout и т.п.).
+- Publisher без своего `sarama.Config` публикует надёжно: `RequiredAcks=WaitForAll`,
+  `Producer.Idempotent=true`, `Net.MaxOpenRequests=1`. Свой `sarama.Config` из
+  `WithPublisherSaramaConfig` берётся как есть — эти значения в нём SDK не меняет.
 - `config.WithPartitioningMarshaler` — публикация с явным partition key, чтобы сохранить порядок сообщений в рамках одного ключа (см. [PUBLISHERREADME](pkg/kafkamq/PUBLISHERREADME.md)).
 
 ---
@@ -121,6 +136,49 @@ err = kafkamq.DeclareTopics(kafkaCfg.BrokersList(), nil, kafkamq.TopicSpec{
 
 ---
 
+## 🔁 Повторы и DLT
+
+Ошибка или паника handler-а (политика по умолчанию `ActionNack`) больше не приводит к
+бесконечной переотправке того же сообщения. Консюмер SDK:
+
+1. повторяет вызов handler-а до `kafkamq.MaxHandleAttempts` (5) раз с паузами 1 с, 5 с, 15 с, 15 с
+   (партиция в это время ждёт — порядок сообщений сохраняется);
+2. затем публикует исходное сообщение в топик `<topic>.dlt` (`kafkamq.DLTTopic(topic)`) на тех же
+   брокерах и с тем же сетевым конфигом, что у subscriber-а, и подтверждает его — offset
+   двигается, следующее сообщение партиции обрабатывается;
+3. если топика `<topic>.dlt` нет (`UNKNOWN_TOPIC_OR_PARTITION`) — SDK один раз пытается создать его
+   (`DeclareTopics`, число партиций и фактор репликации исходного топика) и повторяет публикацию;
+4. если публикация в DLT не удалась — сообщение **не** подтверждается (не теряется), в лог пишется
+   ERROR, публикация повторяется с паузой, пока не пройдёт или сервис не остановят.
+
+Сообщение в DLT: исходные ключ, payload и заголовки (включая `_watermill_message_uuid`) плюс
+`x-dlt-original-topic`, `x-dlt-original-partition`, `x-dlt-original-offset`,
+`x-dlt-consumer-group`, `x-dlt-error` (текст ошибки, до 1024 байт), `x-dlt-attempts`,
+`x-dlt-failed-at` (константы `kafkamq.DLTHeader*`).
+
+Что нужно сделать сервису:
+- создать `<topic>.dlt` заранее (`kafkamq.DeclareTopics`), если у сервиса нет права создавать топики
+  (ACL `CREATE`) и на брокере выключено `auto.create.topics.enable` — иначе ядовитое сообщение
+  остановит партицию с ERROR в логе «failed to publish kafka message to <topic>.dlt»;
+- делать handler идемпотентным (см. ребаланс ниже);
+- решить, кто читает DLT (алерт, ручной разбор, повторная отправка в исходный топик).
+
+Детали:
+- Ошибку в Sentry шлёт одно событие на сообщение — при уходе в DLT (или при `ActionAck`), с
+  номером попытки; промежуточные неудачи — WARN в лог.
+- Остановка сервиса во время паузы между попытками прерывает паузу без подтверждения: после
+  рестарта сообщение придёт снова, счёт попыток начнётся заново.
+- `kafkamq.ActionAck` (`WithErrorAction`/`WithPanicAction`) — как раньше: сразу подтвердить,
+  без повторов и DLT.
+- `config.WithNackResendSleep` больше ни на что не влияет: SDK не делает Nack.
+- Пауза между попытками держит партицию. Ребаланс группы ждёт всю серию попыток, а не одну:
+  watermill ждёт Ack сообщения без ctx сессии. Паузы (1 + 5 + 15 + 15 = 36 с) плюс время handler-а
+  рассчитаны с запасом меньше `Consumer.Group.Rebalance.Timeout` sarama по умолчанию (60 с). Если
+  серия дольше (медленный handler, свой меньший таймаут) — партиция уходит другому участнику,
+  сообщение обрабатывается повторно, возможны дубли в DLT. Handler должен быть идемпотентным.
+
+---
+
 ## 🧩 Работа с консьюмером
 
 [Работа с консьюмером](pkg/kafkamq/CONSUMERREADME.md)
@@ -136,9 +194,16 @@ err = kafkamq.DeclareTopics(kafkaCfg.BrokersList(), nil, kafkamq.TopicSpec{
 ## ♻️ Graceful Shutdown
 
 Kafka kernel автоматически:
-- отменяет контекст consumer-а
-- закрывает все publisher-ы
-- закрывает всех зарегистрированных subscriber-ов (sarama-клиентов)
+- прекращает приём новых сообщений;
+- дожидается текущего handler-а в пределах таймаута остановки приложения (ctx handler-а
+  остановкой не отменяется, его Ack успевает закоммитить offset); не уложился — закрытие всё
+  равно выполняется, неподтверждённое сообщение придёт снова после рестарта;
+- закрывает все publisher-ы (после handler-ов — те могли публиковать);
+- закрывает всех зарегистрированных subscriber-ов (sarama-клиентов) и DLT-продюсеры.
+
+Если `Consume` упал (ошибка подписки, неожиданное закрытие канала сообщений, паника вне
+handler-а), kernel пишет ERROR и останавливает приложение через `app.Fail` — сервис без
+консюмеров не остаётся работать «зомби».
 
 ---
 

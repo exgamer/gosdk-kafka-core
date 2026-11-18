@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/exgamer/gosdk-core/pkg/app"
 	"github.com/exgamer/gosdk-core/pkg/di"
@@ -25,6 +26,9 @@ type KafkaKernel struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// consumeDone закрывается, когда Consume вернулся (все handler-ы завершились).
+	consumeDone chan struct{}
 
 	enableConsumer  bool
 	enablePublisher bool
@@ -100,9 +104,17 @@ func (k *KafkaKernel) Start(a *app.App) error {
 			return err
 		}
 
+		done := make(chan struct{})
+		k.consumeDone = done
+
 		go func() {
+			defer close(done)
+
 			if err := k.consumer.Consume(k.ctx); err != nil {
-				logger.Error(k.ctx, "kafka consumer stopped: "+err.Error())
+				// Не оставляем приложение «зомби» без консюмеров: аварийная остановка
+				// через app.Fail (как http-kernel при падении сервера).
+				logger.Error(k.ctx, "kafka consumer stopped with error, stopping application: "+err.Error())
+				a.Fail(fmt.Errorf("kafka consumer: %w", err))
 				k.cancel()
 			}
 		}()
@@ -111,9 +123,24 @@ func (k *KafkaKernel) Start(a *app.App) error {
 	return nil
 }
 
+// Stop — штатная остановка: прекратить приём сообщений, дождаться текущих handler-ов
+// в пределах ctx, затем закрыть publisher-ы (handler-ы могли публиковать) и subscriber-ов.
+// Если ctx истёк раньше — закрытие всё равно запускается, возвращается ctx.Err();
+// неподтверждённое сообщение будет доставлено снова после рестарта.
 func (k *KafkaKernel) Stop(ctx context.Context) error {
 	if k.cancel != nil {
 		k.cancel()
+	}
+
+	var waitErr error
+
+	if k.consumeDone != nil {
+		select {
+		case <-k.consumeDone:
+		case <-ctx.Done():
+			waitErr = ctx.Err()
+			logger.Error(ctx, "kafka handlers did not finish before shutdown timeout, closing anyway: "+waitErr.Error())
+		}
 	}
 
 	if k.publishersRegistry != nil {
@@ -121,7 +148,7 @@ func (k *KafkaKernel) Stop(ctx context.Context) error {
 	}
 
 	if k.consumer == nil {
-		return nil
+		return waitErr
 	}
 
 	done := make(chan error, 1)
@@ -129,6 +156,10 @@ func (k *KafkaKernel) Stop(ctx context.Context) error {
 
 	select {
 	case err := <-done:
+		if waitErr != nil {
+			return waitErr
+		}
+
 		return err
 	case <-ctx.Done():
 		return ctx.Err()

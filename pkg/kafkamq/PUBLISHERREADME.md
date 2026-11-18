@@ -12,6 +12,10 @@
 - Каждый publisher создаётся **один раз** (собственный sarama sync-producer) и
   переиспользуется на протяжении жизни приложения.
 - На `Stop()` все publisher’ы корректно закрываются.
+- Без своего `sarama.Config` публикация надёжная: `RequiredAcks=WaitForAll`,
+  `Producer.Idempotent=true`, `Net.MaxOpenRequests=1` (подтверждение всеми ISR-репликами,
+  без дублей при ретраях, порядок сохраняется). Свой конфиг из `config.WithPublisherSaramaConfig`
+  SDK не меняет (кроме `ClientID` из `""`/`"watermill"`/`"sarama"` → `KAFKA_CLIENT_ID`).
 
 ### ❌ Неправильный вариант
 Создавать `kafka.NewPublisher(...)` на каждый `Publish()` — дорого (новое TCP
@@ -115,6 +119,10 @@ config.NewPublisherWithPartitioningConfig(func(topic string, msg *message.Messag
 - `PublishWithMetaData(topic string, meta map[string]string, payload any) error`
 - `PublishBatch(topic string, payloads []any) error`
 - `PublishBatchWithMetaData(topic string, meta map[string]string, payloads []any) error`
+- `PublishCtx`, `PublishWithMetaDataCtx`, `PublishBatchCtx`, `PublishBatchWithMetaDataCtx` — то же с `ctx` первым
+  аргументом: ожидание ответа брокера ограничено `ctx`, сквозной id корреляции `ctx` (`sdkctx.CorrelationID`,
+  gosdk-core) уходит в заголовок `correlation_id` (свой `correlation_id` в `meta` главнее; методы без `ctx` id не
+  ставят)
 - `Close() error`
 
 ### PublisherRegistry

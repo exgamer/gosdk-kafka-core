@@ -1,5 +1,66 @@
 # Changelog
 
+## v1.2.0
+
+Ядовитое сообщение больше не останавливает партицию, остановка дожидается текущего handler-а,
+публикация по умолчанию надёжная. Публичный API не сломан (код сервисов компилируется без
+правок), новых переменных окружения и опций-переключателей нет. Из зависимостей — только gosdk-core v1.3.0
+(CorrelationID).
+
+### Добавлено
+- Повторы обработки внутри консюмера и DLT: `kafkamq.MaxHandleAttempts`, `kafkamq.DLTSuffix`,
+  `kafkamq.DLTTopic`, заголовки `kafkamq.DLTHeader*`.
+- Сквозной CorrelationID: `Publisher.PublishCtx`, `PublishWithMetaDataCtx`, `PublishBatchCtx`,
+  `PublishBatchWithMetaDataCtx` — публикация, ограниченная `ctx`; заголовок `correlation_id`
+  (`CorrelationIDMetadataKey`) из `sdkctx.CorrelationID(ctx)` (gosdk-core), если вызывающий не задал свой; методы без
+  `ctx` id не ставят. Обработчик получает `ctx` с id из заголовка `correlation_id` (нет — новый id); повторы и DLT
+  несут тот же id. Требуется gosdk-core v1.3.0.
+
+### Исправлено
+- Ошибка/паника handler-а (`ActionNack`) вызывала бесконечную переотправку того же сообщения
+  каждые 100 мс — партиция стояла. Теперь — до 5 попыток с паузой 1 с, 5 с, 15 с, 15 с, затем
+  публикация в `<topic>.dlt` и Ack.
+- `KAFKA_CLIENT_ID` затирался помощниками `NewConsumerGroupConfig`/`NewConsumerFromOldestConfig`/
+  `NewConsumerFromNewestConfig` и `With*SaramaConfig` с `ClientID="watermill"` — теперь
+  применяется после опций, если `ClientID` в итоговом конфиге пустой, `"watermill"` или `"sarama"`.
+- Остановка отменяла ctx handler-а посреди обработки и закрывала subscriber-ов, не дожидаясь его:
+  Ack после остановки не коммитился. Теперь Stop прекращает приём, ждёт текущий handler в
+  пределах ctx остановки, затем закрывает publisher-ы и subscriber-ов.
+- Падение `Consume` оставляло сервис работать без консюмеров («зомби») — теперь kernel
+  останавливает приложение через `app.Fail`.
+- `DeclareTopics` распознаёт существующий топик через `errors.Is(err, sarama.ErrTopicAlreadyExists)`,
+  а не по тексту ошибки.
+
+### ⚠️ Изменения поведения
+- **Ядовитое сообщение уходит в `<topic>.dlt`** после 5 попыток (36 с пауз плюс время handler-а; всё
+  это время партиция ждёт) и подтверждается. Ребаланс группы ждёт всю серию попыток (watermill ждёт
+  Ack без ctx сессии); паузы рассчитаны с запасом меньше `Rebalance.Timeout` sarama по умолчанию (60 с).
+  При превышении — повторная обработка сообщения и возможные дубли в DLT: handler должен быть
+  идемпотентным. Нет топика `<topic>.dlt` (`UNKNOWN_TOPIC_OR_PARTITION`) — SDK один раз пытается
+  создать его (число партиций и фактор репликации исходного топика; нужно право `CREATE`) и повторяет
+  публикацию. Не удалось — сообщение не подтверждается, партиция стоит, в лог идёт ERROR
+  `failed to publish kafka message to <topic>.dlt`; создайте топик заранее (`kafkamq.DeclareTopics`).
+  DLT-продюсер — на брокерах и сетевом конфиге subscriber-а (TLS/SASL из `WithConsumerSaramaConfig`).
+- `config.WithNackResendSleep` больше ни на что не влияет — SDK не вызывает Nack.
+- Событие в Sentry — одно на сообщение (при уходе в DLT или при `ActionAck`), а не на каждую
+  неудачную доставку; промежуточные неудачи — WARN в лог.
+- **Sentry: payload и заголовки сообщения по умолчанию не отправляются**; в событии — handler,
+  topic, partition, offset, `key_len`, `key_sha256` (первые 8 байт хеша), attempt, `payload_size`.
+  Payload — только при явном `WithSentryPayloadLimit(n)` с `n > 0` (первые `n` байт). `0` и меньше —
+  не отправлять (раньше `0` — целиком, без лимита; по умолчанию было 2 КБ), как в gosdk-rabbit-core.
+- **Publisher без своего `sarama.Config`**: `RequiredAcks=WaitForAll` (было `WaitForLocal`),
+  `Producer.Idempotent=true`, `Net.MaxOpenRequests=1`. Публикация чуть медленнее (ждёт все ISR);
+  при `min.insync.replicas` больше числа живых реплик публикация падает ошибкой вместо тихой потери.
+  На кластере с ACL-авторизацией и брокерами старше 2.8 продюсеру нужно право `IdempotentWrite`.
+  Явный `WithPublisherSaramaConfig` не меняется.
+- Handler получает ctx, который не отменяется остановкой (значения сохранены). Остановка ждёт
+  handler в пределах таймаута остановки приложения; пауза между повторами прерывается сразу, без Ack.
+- Publisher-ы закрываются после завершения handler-ов (раньше — сразу при Stop).
+- Неожиданное закрытие канала сообщений subscriber-а (не после Stop/Close) — теперь ошибка
+  `Consume`, а не тихий выход горутины.
+- Ошибки handler-а пишутся через логгер `gosdk-core` (`[WARN]`/`[ERROR]`, со стеком для паники)
+  вместо `log.Printf`.
+
 ## v1.1.1
 
 Зависимость `gosdk-core` поднята до v1.2.0. API пакета не изменился.
